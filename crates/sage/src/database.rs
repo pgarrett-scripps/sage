@@ -423,11 +423,36 @@ impl Parameters {
             })
             .collect::<Vec<_>>();
 
-        let potential_mods = self
+        let mut potential_mods = self
             .variable_mods
             .iter()
             .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
             .collect::<Vec<(ModificationSpecificity, f32)>>();
+
+        // Discover PEFF / positional modifications so that PTM localization
+        // treats them like variable mods. These masses are baked onto the
+        // peptides at digest time (not present in `variable_mods`), so we
+        // recover them by scanning target peptides for residue modifications
+        // that are neither a configured static nor variable mod. The residue
+        // types actually carrying each mass become its candidate sites.
+        let mass_key = |m: f32| (m * 1e5).round() as i64;
+        let mut known: FnvHashSet<i64> = potential_mods.iter().map(|(_, m)| mass_key(*m)).collect();
+        known.extend(self.static_mods.values().map(|m| mass_key(*m)));
+        let mut seen_pairs: FnvHashSet<(u8, i64)> = FnvHashSet::default();
+        for peptide in target_decoys.iter().filter(|p| !p.decoy) {
+            for (residue, &mass) in peptide.sequence.iter().zip(peptide.modifications.iter()) {
+                if mass == 0.0 {
+                    continue;
+                }
+                let key = mass_key(mass);
+                if known.contains(&key) {
+                    continue;
+                }
+                if seen_pairs.insert((*residue, key)) {
+                    potential_mods.push((ModificationSpecificity::Residue(*residue), mass));
+                }
+            }
+        }
 
         IndexedDatabase {
             peptides: target_decoys,
@@ -465,7 +490,9 @@ pub struct IndexedDatabase {
     pub fragments: Vec<Theoretical>,
     pub ion_kinds: Vec<Kind>,
     pub min_value: Vec<f32>,
-    /// Keep a list of potential (AA, mass) modifications for RT prediction
+    /// Candidate `(specificity, mass)` modifications used for PTM site
+    /// localization. Includes configured variable mods plus any PEFF /
+    /// positional mods discovered on the peptides (as residue specificities).
     pub potential_mods: Vec<(ModificationSpecificity, f32)>,
     pub bucket_size: usize,
     pub generate_decoys: bool,
@@ -833,6 +860,76 @@ mod test {
             seqs.iter().any(|s| phos(s) == 1),
             "shared budget should still place a single PEFF mod: {:?}",
             seqs
+        );
+    }
+
+    #[test]
+    fn peff_mods_are_localizable() {
+        // PEFF annotates Phospho on the serines of MSMSTSTK; the only configured
+        // variable mod is Oxidation on M. The PEFF Phospho should still be
+        // discovered as a localization candidate (Residue('S'), ~79.9663) in the
+        // database's `potential_mods`, even though it is not a variable mod.
+        let peff = "# PEFF 1.0\n\
+            >sp|PROT1 \\ModResUnimod=(2,4,6|UNIMOD:21|Phospho)\n\
+            MSMSTSTK\n";
+        let fasta = Fasta::parse(peff.into(), "rev_", false);
+
+        let params = Parameters {
+            bucket_size: 128,
+            enzyme: EnzymeBuilder {
+                missed_cleavages: Some(0),
+                min_len: Some(6),
+                max_len: Some(10),
+                ..Default::default()
+            },
+            peptide_min_mass: 150.0,
+            peptide_max_mass: 5000.0,
+            ion_kinds: vec![Kind::B, Kind::Y],
+            min_ion_index: 2,
+            // Carbamidomethyl-style static mod that must NOT become a candidate.
+            static_mods: [(ModificationSpecificity::Residue(b'K'), 100.0)]
+                .into_iter()
+                .collect(),
+            variable_mods: [(ModificationSpecificity::Residue(b'M'), vec![15.994915])]
+                .into_iter()
+                .collect(),
+            max_variable_mods: 1,
+            max_peff_variable_mods: Some(3),
+            decoy_tag: "rev_".into(),
+            generate_decoys: false,
+            fasta: "none".into(),
+            prefilter: false,
+            prefilter_chunk_size: 0,
+            prefilter_low_memory: true,
+        };
+
+        let db = params.build(fasta);
+
+        let has = |spec: ModificationSpecificity, mass: f32| {
+            db.potential_mods
+                .iter()
+                .any(|(s, m)| *s == spec && (m - mass).abs() < 1e-3)
+        };
+
+        // PEFF Phospho discovered on serine.
+        assert!(
+            has(ModificationSpecificity::Residue(b'S'), 79.966_33),
+            "PEFF phospho should be a localization candidate on S: {:?}",
+            db.potential_mods
+        );
+        // Configured variable Oxidation still present.
+        assert!(
+            has(ModificationSpecificity::Residue(b'M'), 15.994_915),
+            "variable Oxidation should remain a candidate: {:?}",
+            db.potential_mods
+        );
+        // The static K mod must not be treated as localizable.
+        assert!(
+            !db.potential_mods
+                .iter()
+                .any(|(_, m)| (m - 100.0).abs() < 1e-3),
+            "static mod leaked into localization candidates: {:?}",
+            db.potential_mods
         );
     }
 }

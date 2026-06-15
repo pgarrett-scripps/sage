@@ -7,6 +7,10 @@
 //! MSFragger answer with their "site" reports: **which residue actually carries
 //! the modification, and with what confidence?**
 //!
+//! This covers both configured variable modifications and PEFF / positional
+//! modifications — the database records the candidate residues for both in its
+//! `potential_mods` list.
+//!
 //! For each distinct variable-mod delta mass on the peptide we
 //!   1. recover the set of candidate residues from the search's
 //!      [`ModificationSpecificity`] rules (e.g. all S/T/Y for Phospho),
