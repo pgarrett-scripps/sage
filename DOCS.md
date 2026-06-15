@@ -207,6 +207,7 @@ For additional information about configuration options and output file formats, 
     }
     "max_variable_mods": 2, // Optional[int] {default=2} Limit k-combinations of variable modifications
     "max_peff_variable_mods": 3, // Optional[int] Independent cap for PEFF mods; unset = share max_variable_mods budget
+    "max_modified_peptides": 10000, // Optional[int] {default=10000} Hard cap on modified forms generated per peptide sequence
     "decoy_tag": "rev_",    // Optional[str] {default="rev_"}: See notes above
     "generate_decoys": false, // Optional[bool] {default="true"}: Ignore decoys in FASTA database matching `decoy_tag`
     "fasta": "dual.fasta"   // str: mandatory path to FASTA file
@@ -349,6 +350,7 @@ Example:
 
 - **max_variable_mods**: Integer. Limit k-combinations of variable modifications (default: 2).
 - **max_peff_variable_mods**: Integer, optional. An independent per-peptide budget for PEFF/positional modifications (the per-protein `\ModResUnimod` annotations from a PEFF file). When **unset**, PEFF mods share the single `max_variable_mods` budget with the global variable mods (legacy behavior). When **set**, the two pools get independent budgets: a peptide may carry up to `max_variable_mods` global variable mods *and* up to `max_peff_variable_mods` PEFF mods simultaneously (subject to one mod per site). For example, `max_variable_mods: 1` with `max_peff_variable_mods: 3` allows broad search of up to 1 global mod per peptide while permitting up to 3 of the specific PEFF-annotated modifications.
+- **max_modified_peptides**: Integer. Hard cap on the number of modified peptide forms generated for a single peptide sequence (default: 10000). Independent of `max_variable_mods`/`max_peff_variable_mods`, this is a safety valve: sequences with many modifiable residues can otherwise produce millions of variants and exhaust memory. Generation stops once the cap is reached; because forms are enumerated in order of increasing modification count, the lower-order (most likely) variants are retained. The cap is applied per sequence, so it does not affect peptides with few modifiable sites.
 - **variable_mods**: Dictionary with characters as keys and list of floats (or single floats) as values. Represents variable modifications applied to amino acids or termini (default: {}).
   - Example: Apply a variable modification of 15.9949 to methionine, 49.2022 to the C-terminus of the peptide, 42.0 to the N-terminus of the protein, and 111.0 to the C-terminus of the protein.
     ```jsonc

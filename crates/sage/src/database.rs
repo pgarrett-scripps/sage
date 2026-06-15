@@ -125,6 +125,12 @@ pub struct Builder {
     /// the global variable mods (legacy behavior); when set, the two pools get
     /// independent budgets.
     pub max_peff_variable_mods: Option<usize>,
+    /// Hard cap on the number of modified peptide forms generated per peptide
+    /// sequence. Sequences with many modifiable sites can otherwise produce a
+    /// combinatorial explosion of variants; generation stops once this many
+    /// forms have been produced (default: 10000). Lower-order variants (fewer
+    /// modifications) are generated first, so the most likely forms are kept.
+    pub max_modified_peptides: Option<usize>,
     /// Use this prefix for decoy proteins
     pub decoy_tag: Option<String>,
 
@@ -154,6 +160,7 @@ impl Builder {
             variable_mods: validate_var_mods(self.variable_mods),
             max_variable_mods: self.max_variable_mods.map(|x| x.max(1)).unwrap_or(2),
             max_peff_variable_mods: self.max_peff_variable_mods.map(|x| x.max(1)),
+            max_modified_peptides: self.max_modified_peptides.map(|x| x.max(1)).unwrap_or(10000),
             generate_decoys: self.generate_decoys.unwrap_or(true),
             fasta: self.fasta.expect("A fasta file must be provided!"),
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
@@ -181,6 +188,8 @@ pub struct Parameters {
     /// Independent per-peptide cap for PEFF/positional mods; `None` means PEFF
     /// mods share the `max_variable_mods` budget (legacy behavior).
     pub max_peff_variable_mods: Option<usize>,
+    /// Hard cap on modified peptide forms generated per sequence (default 10000).
+    pub max_modified_peptides: usize,
     pub decoy_tag: String,
     pub generate_decoys: bool,
     pub fasta: String,
@@ -274,6 +283,7 @@ impl Parameters {
                         &self.static_mods,
                         self.max_variable_mods,
                         self.max_peff_variable_mods,
+                        self.max_modified_peptides,
                     )
                     .into_iter()
                     .filter(|peptide| {
@@ -741,6 +751,7 @@ mod test {
                 .collect(),
             max_variable_mods: 2,
             max_peff_variable_mods: None,
+            max_modified_peptides: usize::MAX,
             decoy_tag: "rev_".into(),
             generate_decoys: false,
             fasta: "none".into(),
@@ -807,6 +818,7 @@ mod test {
                 .collect(),
             max_variable_mods: 1,
             max_peff_variable_mods: Some(3),
+            max_modified_peptides: usize::MAX,
             decoy_tag: "rev_".into(),
             generate_decoys: false,
             fasta: "none".into(),
@@ -895,6 +907,7 @@ mod test {
                 .collect(),
             max_variable_mods: 1,
             max_peff_variable_mods: Some(3),
+            max_modified_peptides: usize::MAX,
             decoy_tag: "rev_".into(),
             generate_decoys: false,
             fasta: "none".into(),

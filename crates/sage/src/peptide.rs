@@ -271,6 +271,11 @@ impl Peptide {
     ///   placed on the same peptide (the cross product of the per-pool
     ///   combinations), subject to one-mod-per-site and one-N-/one-C-terminal
     ///   constraint across the combined selection.
+    /// `mod_limit` is a hard cap on the number of modified forms produced for
+    /// this sequence (including the unmodified baseline). Enumeration stops as
+    /// soon as the cap is reached; because variants are generated in order of
+    /// increasing modification count, the lower-order (most likely) forms are
+    /// retained. Pass `usize::MAX` for no limit.
     pub fn apply(
         self,
         variable_mods: &[(ModificationSpecificity, f32)],
@@ -278,6 +283,7 @@ impl Peptide {
         static_mods: &HashMap<ModificationSpecificity, f32>,
         combinations: usize,
         max_positional_mods: Option<usize>,
+        mod_limit: usize,
     ) -> Vec<Peptide> {
         if variable_mods.is_empty() && positional_mods.is_empty() {
             let mut peptide = self;
@@ -313,21 +319,27 @@ impl Peptide {
                 let mut mods = global;
                 mods.extend(positional);
                 dedup_candidates(&mut mods);
-                for n in 1..=combinations {
+                'outer: for n in 1..=combinations {
                     for combination in mods.iter().combinations(n) {
+                        if modified.len() >= mod_limit {
+                            break 'outer;
+                        }
                         build_variant(&self, &combination, &mut modified);
                     }
                 }
             }
             // Independent budgets: cross product of the two pools' combinations.
             Some(max_positional) => {
-                for g in 0..=combinations {
+                'outer: for g in 0..=combinations {
                     for global_combo in global.iter().combinations(g) {
                         for p in 0..=max_positional {
                             if g + p == 0 {
                                 continue; // unmodified baseline already added
                             }
                             for positional_combo in positional.iter().combinations(p) {
+                                if modified.len() >= mod_limit {
+                                    break 'outer;
+                                }
                                 let mut selection = global_combo.clone();
                                 selection.extend(positional_combo.iter().copied());
                                 build_variant(&self, &selection, &mut modified);
@@ -512,7 +524,7 @@ mod test {
         let static_mods = HashMap::default();
         peptide
             .clone()
-            .apply(&mods, &[], &static_mods, combo, None)
+            .apply(&mods, &[], &static_mods, combo, None, usize::MAX)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
@@ -759,12 +771,50 @@ mod test {
         let variable_mods = [(Residue(b'C'), 30.0)];
 
         let peptides = peptide
-            .apply(&variable_mods, &[], &static_mods, 2, None)
+            .apply(&variable_mods, &[], &static_mods, 2, None, usize::MAX)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(peptides, expected);
+    }
+
+    #[test]
+    fn mod_limit_bounds_generated_forms() {
+        use ModificationSpecificity::Residue;
+        // 10 serines, phospho variable mod, up to 5 per peptide would otherwise
+        // generate 1 + C(10,1..=5) = 1+10+45+120+210+252 = 638 forms.
+        let peptide = build_peptide("SSSSSSSSSSK");
+        let static_mods = HashMap::default();
+        let variable = [(Residue(b'S'), 79.96633_f32)];
+
+        // No cap: full enumeration.
+        let full = peptide
+            .clone()
+            .apply(&variable, &[], &static_mods, 5, None, usize::MAX);
+        assert_eq!(full.len(), 638, "unexpected full enumeration size");
+
+        // Hard cap of 100 forms.
+        let capped = peptide
+            .clone()
+            .apply(&variable, &[], &static_mods, 5, None, 100);
+        assert_eq!(capped.len(), 100, "cap not enforced (shared budget)");
+
+        // Cap also applies on the independent-budget (PEFF) path.
+        let positional = vec![(0u32, 15.994915_f32)];
+        let capped_peff =
+            peptide
+                .clone()
+                .apply(&variable, &positional, &static_mods, 5, Some(3), 50);
+        assert!(
+            capped_peff.len() <= 50,
+            "cap not enforced (independent budget): {}",
+            capped_peff.len()
+        );
+
+        // Baseline-only when the cap is 1 (just the unmodified form).
+        let one = peptide.apply(&variable, &[], &static_mods, 5, None, 1);
+        assert_eq!(one.len(), 1);
     }
 
     #[test]
@@ -828,7 +878,7 @@ mod test {
 
         let result = peptide
             .clone()
-            .apply(&[], &positional, &static_mods, 2, None)
+            .apply(&[], &positional, &static_mods, 2, None, usize::MAX)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
@@ -874,7 +924,7 @@ mod test {
         for max_positional in [None, Some(2)] {
             let result = peptide
                 .clone()
-                .apply(&variable, &positional, &static_mods, 2, max_positional)
+                .apply(&variable, &positional, &static_mods, 2, max_positional, usize::MAX)
                 .into_iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>();
@@ -903,7 +953,7 @@ mod test {
 
         let indep = peptide
             .clone()
-            .apply(&variable, &positional, &static_mods, 1, Some(3))
+            .apply(&variable, &positional, &static_mods, 1, Some(3), usize::MAX)
             .iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
@@ -914,7 +964,7 @@ mod test {
         );
 
         let shared = peptide
-            .apply(&variable, &positional, &static_mods, 1, None)
+            .apply(&variable, &positional, &static_mods, 1, None, usize::MAX)
             .iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
@@ -941,7 +991,7 @@ mod test {
         // 1 global mod allowed, 2 positional mods allowed -> up to 3 total.
         let result = peptide
             .clone()
-            .apply(&variable, &positional, &static_mods, 1, Some(2))
+            .apply(&variable, &positional, &static_mods, 1, Some(2), usize::MAX)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
