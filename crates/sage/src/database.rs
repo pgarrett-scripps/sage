@@ -2,7 +2,7 @@ use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
-use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity};
+use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity, VarModEntry};
 use crate::peptide::Peptide;
 use dashmap::DashSet;
 use fnv::FnvBuildHasher;
@@ -74,10 +74,15 @@ pub struct Builder {
     pub min_ion_index: Option<usize>,
     /// Static modifications to add to matching amino acids
     pub static_mods: Option<HashMap<String, f32>>,
-    /// Variable modifications to add to matching amino acids
-    pub variable_mods: Option<HashMap<String, Vec<f32>>>,
+    /// Variable modifications to add to matching amino acids.
+    /// Each entry is either a bare mass (`15.9949`) or a `[mass, max_count]` tuple
+    /// (`[15.9949, 1]`) that limits how many times that mod may appear on one peptide.
+    pub variable_mods: Option<HashMap<String, Vec<VarModEntry>>>,
     /// Limit number of variable modifications on a peptide
     pub max_variable_mods: Option<usize>,
+    /// Hard cap on the total number of modified peptide variants generated per
+    /// unmodified peptide. Variants with fewer PTMs are preferred (generated first).
+    pub max_combinations: Option<usize>,
     /// Use this prefix for decoy proteins
     pub decoy_tag: Option<String>,
 
@@ -106,6 +111,7 @@ impl Builder {
             static_mods: validate_mods(self.static_mods),
             variable_mods: validate_var_mods(self.variable_mods),
             max_variable_mods: self.max_variable_mods.map(|x| x.max(1)).unwrap_or(2),
+            max_combinations: self.max_combinations,
             generate_decoys: self.generate_decoys.unwrap_or(true),
             fasta: self.fasta.expect("A fasta file must be provided!"),
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
@@ -128,8 +134,9 @@ pub struct Parameters {
     pub ion_kinds: Vec<Kind>,
     pub min_ion_index: usize,
     pub static_mods: HashMap<ModificationSpecificity, f32>,
-    pub variable_mods: HashMap<ModificationSpecificity, Vec<f32>>,
+    pub variable_mods: HashMap<ModificationSpecificity, Vec<(f32, Option<usize>)>>,
     pub max_variable_mods: usize,
+    pub max_combinations: Option<usize>,
     pub decoy_tag: String,
     pub generate_decoys: bool,
     pub fasta: String,
@@ -178,7 +185,7 @@ impl Parameters {
         let mods = self
             .variable_mods
             .iter()
-            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
+            .flat_map(|(a, b)| b.iter().map(|b| (*a, b.0, b.1)))
             .collect::<Vec<_>>();
 
         let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
@@ -196,7 +203,7 @@ impl Parameters {
             .filter_map(Result::ok)
             .flat_map_iter(|peptide| {
                 peptide
-                    .apply(&mods, &self.static_mods, self.max_variable_mods)
+                    .apply(&mods, &self.static_mods, self.max_variable_mods, self.max_combinations)
                     .into_iter()
                     .filter(|peptide| {
                         peptide.monoisotopic >= self.peptide_min_mass
@@ -348,7 +355,7 @@ impl Parameters {
         let potential_mods = self
             .variable_mods
             .iter()
-            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
+            .flat_map(|(a, b)| b.iter().map(|b| (*a, b.0)))
             .collect::<Vec<(ModificationSpecificity, f32)>>();
 
         IndexedDatabase {
@@ -631,10 +638,11 @@ mod test {
             ion_kinds: vec![Kind::B, Kind::Y],
             min_ion_index: 2,
             static_mods: HashMap::default(),
-            variable_mods: [(ModificationSpecificity::ProteinN(None), vec![42.0])]
+            variable_mods: [(ModificationSpecificity::ProteinN(None), vec![(42.0, None)])]
                 .into_iter()
                 .collect(),
             max_variable_mods: 2,
+            max_combinations: None,
             decoy_tag: "rev_".into(),
             generate_decoys: false,
             fasta: "none".into(),

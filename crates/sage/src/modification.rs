@@ -4,7 +4,32 @@ use std::{
     str::FromStr,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// A variable modification entry: either a bare mass or a (mass, max_count) pair.
+/// When `max_count` is specified, at most that many instances of this modification
+/// (at this exact mass) are allowed on a single peptide.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum VarModEntry {
+    Mass(f32),
+    MassWithLimit(f32, usize),
+}
+
+impl VarModEntry {
+    pub fn mass(&self) -> f32 {
+        match self {
+            VarModEntry::Mass(m) | VarModEntry::MassWithLimit(m, _) => *m,
+        }
+    }
+
+    pub fn limit(&self) -> Option<usize> {
+        match self {
+            VarModEntry::Mass(_) => None,
+            VarModEntry::MassWithLimit(_, l) => Some(*l),
+        }
+    }
+}
 
 use crate::mass::VALID_AA;
 
@@ -127,14 +152,17 @@ pub fn validate_mods(input: Option<HashMap<String, f32>>) -> HashMap<Modificatio
 }
 
 pub fn validate_var_mods(
-    input: Option<HashMap<String, Vec<f32>>>,
-) -> HashMap<ModificationSpecificity, Vec<f32>> {
+    input: Option<HashMap<String, Vec<VarModEntry>>>,
+) -> HashMap<ModificationSpecificity, Vec<(f32, Option<usize>)>> {
     let mut output = HashMap::new();
     if let Some(input) = input {
-        for (s, mass) in input {
+        for (s, entries) in input {
             match ModificationSpecificity::from_str(&s) {
                 Ok(m) => {
-                    output.insert(m, mass);
+                    output.insert(
+                        m,
+                        entries.iter().map(|e| (e.mass(), e.limit())).collect(),
+                    );
                 }
                 Err(InvalidModification::Empty) => {
                     log::error!("Skipping invalid modification string: empty")

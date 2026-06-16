@@ -153,33 +153,40 @@ impl Peptide {
         }
     }
 
-    fn push_resi(&self, acc: &mut Vec<(Site, f32)>, target: ModificationSpecificity, mass: f32) {
+    fn push_resi(
+        &self,
+        acc: &mut Vec<(Site, f32, usize)>,
+        target: ModificationSpecificity,
+        mass: f32,
+        mod_idx: usize,
+    ) {
         match (target, self.position) {
-            (ModificationSpecificity::PeptideN(None), _) => acc.push((Site::Nterm, mass)),
+            (ModificationSpecificity::PeptideN(None), _) => acc.push((Site::Nterm, mass, mod_idx)),
             (ModificationSpecificity::PeptideN(Some(resi)), _)
                 if resi == *self.sequence.first().unwrap_or(&0) =>
             {
-                acc.push((Site::Sequence(0), mass))
+                acc.push((Site::Sequence(0), mass, mod_idx))
             }
-            (ModificationSpecificity::PeptideC(None), _) => acc.push((Site::Cterm, mass)),
+            (ModificationSpecificity::PeptideC(None), _) => acc.push((Site::Cterm, mass, mod_idx)),
             (ModificationSpecificity::PeptideC(Some(resi)), _)
                 if resi == *self.sequence.last().unwrap_or(&0) =>
             {
                 acc.push((
                     Site::Sequence(self.sequence.len().saturating_sub(1) as u32),
                     mass,
+                    mod_idx,
                 ))
             }
             (ModificationSpecificity::ProteinN(None), Position::Nterm | Position::Full) => {
-                acc.push((Site::Nterm, mass))
+                acc.push((Site::Nterm, mass, mod_idx))
             }
             (ModificationSpecificity::ProteinN(Some(resi)), Position::Nterm | Position::Full)
                 if resi == *self.sequence.first().unwrap_or(&0) =>
             {
-                acc.push((Site::Sequence(0), mass))
+                acc.push((Site::Sequence(0), mass, mod_idx))
             }
             (ModificationSpecificity::ProteinC(None), Position::Cterm | Position::Full) => {
-                acc.push((Site::Cterm, mass))
+                acc.push((Site::Cterm, mass, mod_idx))
             }
             (ModificationSpecificity::ProteinC(Some(resi)), Position::Cterm | Position::Full)
                 if resi == *self.sequence.last().unwrap_or(&0) =>
@@ -187,6 +194,7 @@ impl Peptide {
                 acc.push((
                     Site::Sequence(self.sequence.len().saturating_sub(1) as u32),
                     mass,
+                    mod_idx,
                 ))
             }
             (ModificationSpecificity::Residue(resi), _) => {
@@ -196,7 +204,7 @@ impl Peptide {
                         .enumerate()
                         .filter_map(|(idx, residue)| {
                             if resi == *residue {
-                                Some((Site::Sequence(idx as u32), mass))
+                                Some((Site::Sequence(idx as u32), mass, mod_idx))
                             } else {
                                 None
                             }
@@ -254,12 +262,16 @@ impl Peptide {
         }
     }
 
-    /// Apply variable modifications, then static modifications to a peptide
+    /// Apply variable modifications, then static modifications to a peptide.
+    /// `variable_mods` entries are `(specificity, mass, per_mod_limit)`.
+    /// `max_combinations` caps total variants (unmodified + modified); fewer-PTM
+    /// variants are always generated first so they are preferred when truncating.
     pub fn apply(
         mut self,
-        variable_mods: &[(ModificationSpecificity, f32)],
+        variable_mods: &[(ModificationSpecificity, f32, Option<usize>)],
         static_mods: &HashMap<ModificationSpecificity, f32>,
         combinations: usize,
+        max_combinations: Option<usize>,
     ) -> Vec<Peptide> {
         if variable_mods.is_empty() {
             for (target, mass) in static_mods {
@@ -268,27 +280,55 @@ impl Peptide {
             self.monoisotopic += self.modification_mass();
             vec![self]
         } else {
-            let mut mods = Vec::new();
-            for (residue, mass) in variable_mods.iter() {
-                self.push_resi(&mut mods, *residue, *mass);
+            let mut mods: Vec<(Site, f32, usize)> = Vec::new();
+            for (mod_idx, (residue, mass, _limit)) in variable_mods.iter().enumerate() {
+                self.push_resi(&mut mods, *residue, *mass, mod_idx);
             }
 
             let mut modified = Vec::new();
             modified.push(self.clone());
 
-            for n in 1..=combinations {
+            'outer: for n in 1..=combinations {
                 'next: for combination in mods.iter().combinations(n).filter(no_duplicates) {
                     let mut set = FnvHashSet::default();
-                    for (site, _) in &combination {
+                    for (site, _, _) in &combination {
                         if !set.insert(*site) {
                             continue 'next;
                         }
                     }
+
+                    // Enforce per-mod count limits
+                    let mut mod_counts = [0usize; 64];
+                    let mut overflow = std::collections::HashMap::new();
+                    for (_, _, mod_idx) in &combination {
+                        if *mod_idx < 64 {
+                            mod_counts[*mod_idx] += 1;
+                        } else {
+                            *overflow.entry(*mod_idx).or_insert(0usize) += 1;
+                        }
+                    }
+                    for (_, _, mod_idx) in &combination {
+                        if let Some(limit) = variable_mods[*mod_idx].2 {
+                            let count = if *mod_idx < 64 {
+                                mod_counts[*mod_idx]
+                            } else {
+                                overflow[mod_idx]
+                            };
+                            if count > limit {
+                                continue 'next;
+                            }
+                        }
+                    }
+
                     let mut peptide = self.clone();
-                    for (site, mass) in combination {
+                    for (site, mass, _) in combination {
                         peptide.apply_site(*site, *mass);
                     }
                     modified.push(peptide);
+
+                    if max_combinations.is_some_and(|cap| modified.len() >= cap) {
+                        break 'outer;
+                    }
                 }
             }
 
@@ -318,10 +358,10 @@ impl Peptide {
     }
 }
 
-fn no_duplicates(combination: &Vec<&(Site, f32)>) -> bool {
+fn no_duplicates(combination: &Vec<&(Site, f32, usize)>) -> bool {
     let mut n = 0;
     let mut c = 0;
-    for (site, _) in combination {
+    for (site, _, _) in combination {
         match site {
             Site::Nterm => n += 1,
             Site::Cterm => c += 1,
@@ -418,9 +458,11 @@ mod test {
         combo: usize,
     ) -> Vec<String> {
         let static_mods = HashMap::default();
+        let mods_with_limits: Vec<(ModificationSpecificity, f32, Option<usize>)> =
+            mods.iter().map(|&(s, m)| (s, m, None)).collect();
         peptide
             .clone()
-            .apply(&mods, &static_mods, combo)
+            .apply(&mods_with_limits, &static_mods, combo, None)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
@@ -664,15 +706,64 @@ mod test {
         let mut static_mods = HashMap::new();
         static_mods.insert(Residue(b'C'), 57.0);
 
-        let variable_mods = [(Residue(b'C'), 30.0)];
+        let variable_mods = [(Residue(b'C'), 30.0, None)];
 
         let peptides = peptide
-            .apply(&variable_mods, &static_mods, 2)
+            .apply(&variable_mods, &static_mods, 2, None)
             .into_iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(peptides, expected);
+    }
+
+    #[test]
+    fn test_per_mod_limit() {
+        use ModificationSpecificity::*;
+        // GCMGCMG has two M residues; limit oxidation to max 1 per peptide
+        let variable_mods = [(Residue(b'M'), 16.0f32, Some(1))];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, None)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        // Should get unmodified + each single-M variant, but NOT the double-M variant
+        let expected = vec!["GCMGCMG", "GCM[+16]GCMG", "GCMGCM[+16]G"];
+        assert_eq!(peptides, expected);
+    }
+
+    #[test]
+    fn test_max_combinations() {
+        use ModificationSpecificity::*;
+        // GCMGCMG with oxidation and carbamidomethylation would normally yield many variants;
+        // cap at 4 total (unmodified + 3 modified)
+        let variable_mods = [(Residue(b'M'), 16.0f32, None), (Residue(b'C'), 57.0, None)];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, Some(4))
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        // Cap at 4: unmodified + the first 3 single-mod variants (fewest PTMs first)
+        assert_eq!(peptides.len(), 4);
+        assert_eq!(peptides[0], "GCMGCMG");
     }
 
     #[test]
@@ -685,36 +776,39 @@ mod test {
         .unwrap();
 
         let mut mods = vec![];
-        peptide.push_resi(&mut mods, ModificationSpecificity::Residue(b'C'), 16.0);
-        assert_eq!(mods, vec![(Sequence(2), 16.0), (Sequence(5), 16.0)]);
+        peptide.push_resi(&mut mods, ModificationSpecificity::Residue(b'C'), 16.0, 0);
+        assert_eq!(mods, vec![(Sequence(2), 16.0, 0), (Sequence(5), 16.0, 0)]);
         mods.clear();
 
-        peptide.push_resi(&mut mods, ModificationSpecificity::PeptideC(None), 16.0);
-        assert_eq!(mods, vec![(Cterm, 16.0)]);
+        peptide.push_resi(&mut mods, ModificationSpecificity::PeptideC(None), 16.0, 0);
+        assert_eq!(mods, vec![(Cterm, 16.0, 0)]);
         mods.clear();
 
-        peptide.push_resi(&mut mods, ModificationSpecificity::PeptideN(None), 16.0);
-        assert_eq!(mods, vec![(Nterm, 16.0)]);
+        peptide.push_resi(&mut mods, ModificationSpecificity::PeptideN(None), 16.0, 0);
+        assert_eq!(mods, vec![(Nterm, 16.0, 0)]);
         mods.clear();
 
         let mut mods = vec![];
-        for (residue, mass) in [("^", 12.0), ("$", 200.0), ("C", 57.0), ("A", 43.0)] {
-            peptide.push_resi(&mut mods, residue.parse().unwrap(), mass);
+        for (idx, (residue, mass)) in [("^", 12.0), ("$", 200.0), ("C", 57.0), ("A", 43.0)]
+            .iter()
+            .enumerate()
+        {
+            peptide.push_resi(&mut mods, residue.parse().unwrap(), *mass, idx);
         }
 
         assert_eq!(
             mods,
             vec![
-                (Nterm, 12.0),
-                (Cterm, 200.0),
-                (Sequence(2), 57.0),
-                (Sequence(5), 57.0),
-                (Sequence(0), 43.0),
-                (Sequence(1), 43.0),
-                (Sequence(3), 43.0),
-                (Sequence(4), 43.0),
-                (Sequence(6), 43.0),
-                (Sequence(7), 43.0),
+                (Nterm, 12.0, 0),
+                (Cterm, 200.0, 1),
+                (Sequence(2), 57.0, 2),
+                (Sequence(5), 57.0, 2),
+                (Sequence(0), 43.0, 3),
+                (Sequence(1), 43.0, 3),
+                (Sequence(3), 43.0, 3),
+                (Sequence(4), 43.0, 3),
+                (Sequence(6), 43.0, 3),
+                (Sequence(7), 43.0, 3),
             ]
         );
     }
