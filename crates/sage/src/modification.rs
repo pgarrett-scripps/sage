@@ -114,6 +114,27 @@ pub enum MassOrName {
     Name(String),
 }
 
+/// A single variable-modification entry. Either a bare mass/name (no per-mod
+/// occurrence limit, the historical behavior) or a `[mass_or_name, max]` pair
+/// that caps how many times this particular modification may appear on a single
+/// peptide. The two forms can be mixed within one residue's list, e.g.
+/// `"C": [[57.0215, 2], 119.0]`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum VariableMod {
+    Simple(MassOrName),
+    Limited(MassOrName, usize),
+}
+
+impl VariableMod {
+    fn parts(&self) -> (&MassOrName, Option<usize>) {
+        match self {
+            VariableMod::Simple(m) => (m, None),
+            VariableMod::Limited(m, max) => (m, Some(*max)),
+        }
+    }
+}
+
 impl MassOrName {
     /// Resolve to a numeric mass. When the input is a name, register the
     /// (canonical) Unimod label so that downstream output renders the name
@@ -165,26 +186,29 @@ pub fn validate_mods(
 }
 
 pub fn validate_var_mods(
-    input: Option<HashMap<String, Vec<MassOrName>>>,
-) -> HashMap<ModificationSpecificity, Vec<f32>> {
+    input: Option<HashMap<String, Vec<VariableMod>>>,
+) -> HashMap<ModificationSpecificity, Vec<(f32, Option<usize>)>> {
     let mut output = HashMap::new();
     if let Some(input) = input {
         for (s, values) in input {
             match ModificationSpecificity::from_str(&s) {
                 Ok(m) => {
-                    let resolved: Vec<f32> = values
+                    let resolved: Vec<(f32, Option<usize>)> = values
                         .iter()
                         .filter_map(|v| {
-                            let r = v.resolve();
-                            if r.is_none() {
-                                if let MassOrName::Name(n) = v {
-                                    log::error!(
-                                        "Unknown Unimod modification name '{}' for variable mod on {}",
-                                        n, s
-                                    );
+                            let (mon, limit) = v.parts();
+                            match mon.resolve() {
+                                Some(mass) => Some((mass, limit)),
+                                None => {
+                                    if let MassOrName::Name(n) = mon {
+                                        log::error!(
+                                            "Unknown Unimod modification name '{}' for variable mod on {}",
+                                            n, s
+                                        );
+                                    }
+                                    None
                                 }
                             }
-                            r
                         })
                         .collect();
                     if !resolved.is_empty() {
@@ -231,6 +255,40 @@ mod test {
         assert!(
             (out[&ModificationSpecificity::Residue(b'M')] - 15.994915).abs() < 1e-4
         );
+    }
+
+    #[test]
+    fn variable_mods_parse_optional_per_mod_limits() {
+        use ModificationSpecificity::*;
+        // Mix bare masses/names with `[mass_or_name, max]` tuples in one config.
+        let json = r#"{
+            "M": [15.9949],
+            "C": [[57.0215, 2], 119.0],
+            "[": [["Phospho", 1]]
+        }"#;
+        let input: HashMap<String, Vec<VariableMod>> = serde_json::from_str(json).unwrap();
+        let out = validate_var_mods(Some(input));
+
+        // M: a single unlimited Oxidation-ish mass.
+        let m = &out[&Residue(b'M')];
+        assert_eq!(m.len(), 1);
+        assert!((m[0].0 - 15.9949).abs() < 1e-4 && m[0].1.is_none());
+
+        // C: a limited (max 2) mass plus an unlimited mass.
+        let c = &out[&Residue(b'C')];
+        assert_eq!(c.len(), 2);
+        assert!(c
+            .iter()
+            .any(|(mass, lim)| (mass - 57.0215).abs() < 1e-3 && *lim == Some(2)));
+        assert!(c
+            .iter()
+            .any(|(mass, lim)| (mass - 119.0).abs() < 1e-3 && lim.is_none()));
+
+        // Protein N-term: a named mod with a limit of 1.
+        let nterm = &out[&ProteinN(None)];
+        assert_eq!(nterm.len(), 1);
+        assert_eq!(nterm[0].1, Some(1));
+        assert!((nterm[0].0 - 79.96633).abs() < 1e-3); // Phospho resolved by name
     }
 
     #[test]

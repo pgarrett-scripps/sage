@@ -2,7 +2,9 @@ use crate::enzyme::{group_digests, DigestGroup, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
-use crate::modification::{validate_mods, validate_var_mods, MassOrName, ModificationSpecificity};
+use crate::modification::{
+    validate_mods, validate_var_mods, MassOrName, ModificationSpecificity, VariableMod,
+};
 use crate::peff::PeffMod;
 use crate::peptide::Peptide;
 use crate::unimod;
@@ -117,7 +119,7 @@ pub struct Builder {
     pub static_mods: Option<HashMap<String, MassOrName>>,
     /// Variable modifications to add to matching amino acids. Each list
     /// entry accepts the same number-or-name forms as `static_mods`.
-    pub variable_mods: Option<HashMap<String, Vec<MassOrName>>>,
+    pub variable_mods: Option<HashMap<String, Vec<VariableMod>>>,
     /// Limit number of variable modifications on a peptide
     pub max_variable_mods: Option<usize>,
     /// Independent cap on the number of PEFF/positional modifications per
@@ -183,7 +185,11 @@ pub struct Parameters {
     pub ion_kinds: Vec<Kind>,
     pub min_ion_index: usize,
     pub static_mods: HashMap<ModificationSpecificity, f32>,
-    pub variable_mods: HashMap<ModificationSpecificity, Vec<f32>>,
+    /// For each modification specificity, the list of `(delta mass, optional
+    /// per-peptide occurrence limit)` variable modifications. `None` means the
+    /// modification has no individual cap (it is still bounded by
+    /// `max_variable_mods` and `max_modified_peptides`).
+    pub variable_mods: HashMap<ModificationSpecificity, Vec<(f32, Option<usize>)>>,
     pub max_variable_mods: usize,
     /// Independent per-peptide cap for PEFF/positional mods; `None` means PEFF
     /// mods share the `max_variable_mods` budget (legacy behavior).
@@ -253,8 +259,8 @@ impl Parameters {
         let mods = self
             .variable_mods
             .iter()
-            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
-            .collect::<Vec<_>>();
+            .flat_map(|(a, b)| b.iter().map(|(mass, limit)| (*a, *mass, *limit)))
+            .collect::<Vec<(ModificationSpecificity, f32, Option<usize>)>>();
 
         let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
         digests
@@ -436,7 +442,7 @@ impl Parameters {
         let mut potential_mods = self
             .variable_mods
             .iter()
-            .flat_map(|(a, b)| b.iter().map(|b| (*a, *b)))
+            .flat_map(|(a, b)| b.iter().map(|(mass, _limit)| (*a, *mass)))
             .collect::<Vec<(ModificationSpecificity, f32)>>();
 
         // Discover PEFF / positional modifications so that PTM localization
@@ -746,7 +752,7 @@ mod test {
             ion_kinds: vec![Kind::B, Kind::Y],
             min_ion_index: 2,
             static_mods: HashMap::default(),
-            variable_mods: [(ModificationSpecificity::ProteinN(None), vec![42.0])]
+            variable_mods: [(ModificationSpecificity::ProteinN(None), vec![(42.0, None)])]
                 .into_iter()
                 .collect(),
             max_variable_mods: 2,
@@ -813,7 +819,7 @@ mod test {
             ion_kinds: vec![Kind::B, Kind::Y],
             min_ion_index: 2,
             static_mods: HashMap::default(),
-            variable_mods: [(ModificationSpecificity::Residue(b'M'), vec![15.994915])]
+            variable_mods: [(ModificationSpecificity::Residue(b'M'), vec![(15.994915, None)])]
                 .into_iter()
                 .collect(),
             max_variable_mods: 1,
@@ -902,7 +908,7 @@ mod test {
             static_mods: [(ModificationSpecificity::Residue(b'K'), 100.0)]
                 .into_iter()
                 .collect(),
-            variable_mods: [(ModificationSpecificity::Residue(b'M'), vec![15.994915])]
+            variable_mods: [(ModificationSpecificity::Residue(b'M'), vec![(15.994915, None)])]
                 .into_iter()
                 .collect(),
             max_variable_mods: 1,

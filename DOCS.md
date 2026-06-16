@@ -197,13 +197,17 @@ For additional information about configuration options and output file formats, 
       "K": 304.207,         // Apply static modification to lysine
       "C": 57.0215          // Apply static modification to cysteine
     },
-    "variable_mods": {    // Optional[Dict[char, float]] {default={}}, variable modifications
+    "variable_mods": {    // Optional[Dict[char, List]] {default={}}, variable modifications
       "M": [15.9949],     // Variable mods are applied *before* static mod
       "^Q": [-17.026549],
       "^E": [-18.010565], // Applied to N-terminal glutamic acid
       "$": [49.2, 22.9],  // Applied to peptide C-terminus
       "[": [42.0],          // Applied to protein N-terminus
-      "]": [111.0]          // Applied to protein C-terminus
+      "]": [111.0],         // Applied to protein C-terminus
+      // Each entry is either a bare mass/name (no per-mod limit) or a
+      // [mass_or_name, max_occurrences] pair; the two forms can be mixed.
+      "C": [[57.0215, 2], 119.0],   // <=2 carbamidomethyls, plus an unlimited +119
+      "S": [["Phospho", 3]]         // at most 3 phospho per peptide
     }
     "max_variable_mods": 2, // Optional[int] {default=2} Limit k-combinations of variable modifications
     "max_peff_variable_mods": 3, // Optional[int] Independent cap for PEFF mods; unset = share max_variable_mods budget
@@ -370,6 +374,14 @@ Example:
     "$X": Modification to be applied to amino acid X if it appears at the C-terminus of a peptide
     "[X": Modification to be applied to amino acid X if it appears at the N-terminus of a protein
     "]X": Modification to be applied to amino acid X if it appears at the C-terminus of a protein
+  - **Per-modification occurrence limits**: each entry in a residue's list is either a bare mass/name (no per-mod limit — the default), or a `[mass_or_name, max_occurrences]` pair capping how many times *that specific* modification may appear on a single peptide. The two forms can be mixed within one residue. This is independent of (and composes with) `max_variable_mods` and `max_modified_peptides`.
+    ```jsonc
+    "variable_mods": {
+      "M": [15.9949],               // unlimited (subject to max_variable_mods)
+      "C": [["Carbamidomethyl", 2], 119.0], // <=2 carbamidomethyls + unlimited +119
+      "S": [[79.9663, 3]]           // at most 3 phospho-serines per peptide
+    }
+    ```
 
 ### Decoys
 

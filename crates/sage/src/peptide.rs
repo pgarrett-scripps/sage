@@ -276,9 +276,14 @@ impl Peptide {
     /// soon as the cap is reached; because variants are generated in order of
     /// increasing modification count, the lower-order (most likely) forms are
     /// retained. Pass `usize::MAX` for no limit.
+    ///
+    /// Each variable mod is `(specificity, delta mass, optional per-peptide
+    /// occurrence limit)`. A `Some(n)` limit caps how many times that specific
+    /// modification may appear on one peptide, independently of `combinations`
+    /// (the overall `max_variable_mods` budget).
     pub fn apply(
         self,
-        variable_mods: &[(ModificationSpecificity, f32)],
+        variable_mods: &[(ModificationSpecificity, f32, Option<usize>)],
         positional_mods: &[(u32, f32)],
         static_mods: &HashMap<ModificationSpecificity, f32>,
         combinations: usize,
@@ -295,18 +300,24 @@ impl Peptide {
         }
 
         // Build the global variable-mod candidate pool, deduped by (site, mass).
-        let mut global: Vec<(Site, f32)> = Vec::new();
-        for (residue, mass) in variable_mods.iter() {
-            self.push_resi(&mut global, *residue, *mass);
+        // `push_resi` expands one (specificity, mass) entry into its matching
+        // sites; we tag each resulting candidate with that entry's occurrence
+        // limit so `build_variant` can enforce it.
+        let mut global: Vec<(Site, f32, Option<usize>)> = Vec::new();
+        for (residue, mass, limit) in variable_mods.iter() {
+            let mut sites = Vec::new();
+            self.push_resi(&mut sites, *residue, *mass);
+            global.extend(sites.into_iter().map(|(site, mass)| (site, mass, *limit)));
         }
         dedup_candidates(&mut global);
 
         // Build the positional (PEFF) candidate pool, deduped by (site, mass).
+        // Positional mods carry no per-mod limit (capped by `max_positional_mods`).
         let seq_len = self.sequence.len() as u32;
-        let mut positional: Vec<(Site, f32)> = positional_mods
+        let mut positional: Vec<(Site, f32, Option<usize>)> = positional_mods
             .iter()
             .filter(|(idx, _)| *idx < seq_len)
-            .map(|(idx, mass)| (Site::Sequence(*idx), *mass))
+            .map(|(idx, mass)| (Site::Sequence(*idx), *mass, None))
             .collect();
         dedup_candidates(&mut positional);
 
@@ -382,18 +393,26 @@ impl Peptide {
 /// Remove duplicate `(Site, mass)` candidates, rounding mass to 5 decimal places
 /// so a user-supplied variable mod and a PEFF-derived mod that resolve to the
 /// same site/mass collapse to one candidate.
-fn dedup_candidates(mods: &mut Vec<(Site, f32)>) {
+fn dedup_candidates(mods: &mut Vec<(Site, f32, Option<usize>)>) {
     let mut seen = FnvHashSet::default();
-    mods.retain(|(site, mass)| seen.insert((*site, (*mass * 1e5).round() as i64)));
+    mods.retain(|(site, mass, _)| seen.insert((*site, (*mass * 1e5).round() as i64)));
 }
 
 /// Build one modified peptide from a candidate selection, rejecting it if it
-/// reuses a site or carries more than one N-terminal or one C-terminal mod.
-fn build_variant(base: &Peptide, selection: &[&(Site, f32)], out: &mut Vec<Peptide>) {
+/// reuses a site, carries more than one N-terminal or one C-terminal mod, or
+/// exceeds any modification's per-peptide occurrence limit.
+fn build_variant(
+    base: &Peptide,
+    selection: &[&(Site, f32, Option<usize>)],
+    out: &mut Vec<Peptide>,
+) {
     let mut n = 0;
     let mut c = 0;
     let mut sites = FnvHashSet::default();
-    for (site, _) in selection {
+    // Per-mod occurrence counts, keyed by (rounded mass, declared limit), so a
+    // mod with a limit is counted independently from an unlimited one.
+    let mut counts: HashMap<(i64, usize), usize> = HashMap::new();
+    for (site, mass, limit) in selection {
         match site {
             Site::Nterm => n += 1,
             Site::Cterm => c += 1,
@@ -402,12 +421,21 @@ fn build_variant(base: &Peptide, selection: &[&(Site, f32)], out: &mut Vec<Pepti
         if !sites.insert(*site) {
             return; // two mods on the same site
         }
+        if let Some(max) = limit {
+            let count = counts
+                .entry(((*mass * 1e5).round() as i64, *max))
+                .or_insert(0);
+            *count += 1;
+            if *count > *max {
+                return; // exceeds this modification's per-peptide limit
+            }
+        }
     }
     if n > 1 || c > 1 {
         return;
     }
     let mut peptide = base.clone();
-    for (site, mass) in selection {
+    for (site, mass, _) in selection {
         peptide.apply_site(*site, *mass);
     }
     out.push(peptide);
@@ -522,6 +550,8 @@ mod test {
         combo: usize,
     ) -> Vec<String> {
         let static_mods = HashMap::default();
+        // These tests predate per-mod limits; lift the 2-tuples to unlimited.
+        let mods: Vec<_> = mods.iter().map(|(s, m)| (*s, *m, None)).collect();
         peptide
             .clone()
             .apply(&mods, &[], &static_mods, combo, None, usize::MAX)
@@ -768,7 +798,7 @@ mod test {
         let mut static_mods = HashMap::new();
         static_mods.insert(Residue(b'C'), 57.0);
 
-        let variable_mods = [(Residue(b'C'), 30.0)];
+        let variable_mods = [(Residue(b'C'), 30.0, None)];
 
         let peptides = peptide
             .apply(&variable_mods, &[], &static_mods, 2, None, usize::MAX)
@@ -786,7 +816,7 @@ mod test {
         // generate 1 + C(10,1..=5) = 1+10+45+120+210+252 = 638 forms.
         let peptide = build_peptide("SSSSSSSSSSK");
         let static_mods = HashMap::default();
-        let variable = [(Residue(b'S'), 79.96633_f32)];
+        let variable = [(Residue(b'S'), 79.96633_f32, None)];
 
         // No cap: full enumeration.
         let full = peptide
@@ -815,6 +845,65 @@ mod test {
         // Baseline-only when the cap is 1 (just the unmodified form).
         let one = peptide.apply(&variable, &[], &static_mods, 5, None, 1);
         assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn per_mod_occurrence_limit() {
+        use ModificationSpecificity::Residue;
+        // 4 cysteines; allow up to 3 mods per peptide (combinations), but cap
+        // this particular modification at 2 occurrences.
+        let peptide = build_peptide("CCCCK");
+        let static_mods = HashMap::default();
+        let count = |p: &Peptide| {
+            p.modifications
+                .iter()
+                .filter(|&&m| (m - 57.0).abs() < 1e-3)
+                .count()
+        };
+
+        // Limit of 2: no variant carries 3+, and a 2-occurrence variant exists.
+        let limited = peptide
+            .clone()
+            .apply(&[(Residue(b'C'), 57.0, Some(2))], &[], &static_mods, 3, None, usize::MAX);
+        assert!(
+            limited.iter().all(|p| count(p) <= 2),
+            "per-mod limit of 2 violated: {:?}",
+            limited.iter().map(|p| count(p)).collect::<Vec<_>>()
+        );
+        assert!(limited.iter().any(|p| count(p) == 2), "no 2-occurrence form");
+
+        // Without the limit, a 3-occurrence variant is produced.
+        let unlimited = peptide
+            .clone()
+            .apply(&[(Residue(b'C'), 57.0, None)], &[], &static_mods, 3, None, usize::MAX);
+        assert!(
+            unlimited.iter().any(|p| count(p) == 3),
+            "unlimited mod should reach 3 occurrences"
+        );
+
+        // Mixed list: limited 57.0 (max 1) and unlimited 80.0 on the same residue.
+        let mixed = peptide.apply(
+            &[(Residue(b'C'), 57.0, Some(1)), (Residue(b'C'), 80.0, None)],
+            &[],
+            &static_mods,
+            3,
+            None,
+            usize::MAX,
+        );
+        let count80 = |p: &Peptide| {
+            p.modifications
+                .iter()
+                .filter(|&&m| (m - 80.0).abs() < 1e-3)
+                .count()
+        };
+        assert!(
+            mixed.iter().all(|p| count(p) <= 1),
+            "limited mod exceeded its cap of 1"
+        );
+        assert!(
+            mixed.iter().any(|p| count80(p) >= 2),
+            "unlimited mod in a mixed list should still exceed the other's cap"
+        );
     }
 
     #[test]
@@ -933,7 +1022,7 @@ mod test {
         // at the C residue resolve to the same `(Site::Sequence(1), mass)`.
         // After dedup at 5 dp they should produce a single modified variant
         // (plus the unmodified baseline) — not two duplicates.
-        let variable = [(Residue(b'C'), 57.021_46_f32)];
+        let variable = [(Residue(b'C'), 57.021_46_f32, None)];
         let positional = vec![(1u32, 57.021_46_f32)];
 
         // Both the shared-budget (None) and independent-budget (Some) paths must
@@ -964,7 +1053,7 @@ mod test {
         let peptide = build_peptide("KAAKAAK"); // K at indices 0, 3, 6
         let static_mods = HashMap::default();
         let acetyl = 42.010_565_f32;
-        let variable = [(Residue(b'K'), acetyl)]; // global Acetyl on every K
+        let variable = [(Residue(b'K'), acetyl, None)]; // global Acetyl on every K
         let positional = vec![(0u32, acetyl)]; // PEFF Acetyl at K index 0 only
         let ac = |s: &str| s.matches("[+42.0105").count();
 
@@ -1002,7 +1091,7 @@ mod test {
         let oxidation = 15.994_915_f32;
         let carbamido = 57.021_465_f32;
 
-        let variable = [(Residue(b'M'), oxidation)];
+        let variable = [(Residue(b'M'), oxidation, None)];
         let positional = vec![(1u32, carbamido), (3u32, carbamido)];
 
         // 1 global mod allowed, 2 positional mods allowed -> up to 3 total.
