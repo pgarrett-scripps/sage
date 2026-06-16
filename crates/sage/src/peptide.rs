@@ -320,15 +320,15 @@ impl Peptide {
                         }
                     }
 
+                    if max_combinations.is_some_and(|cap| modified.len() >= cap) {
+                        break 'outer;
+                    }
+
                     let mut peptide = self.clone();
                     for (site, mass, _) in combination {
                         peptide.apply_site(*site, *mass);
                     }
                     modified.push(peptide);
-
-                    if max_combinations.is_some_and(|cap| modified.len() >= cap) {
-                        break 'outer;
-                    }
                 }
             }
 
@@ -811,5 +811,147 @@ mod test {
                 (Sequence(7), 43.0, 3),
             ]
         );
+    }
+
+    #[test]
+    fn test_per_mod_limit_exactly_met() {
+        use ModificationSpecificity::*;
+        // Limit of 2 on a peptide with exactly 2 M residues — all combos should be allowed
+        let variable_mods = [(Residue(b'M'), 16.0f32, Some(2))];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, None)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        // No restriction: unmodified + each single + double
+        let expected = vec![
+            "GCMGCMG",
+            "GCM[+16]GCMG",
+            "GCMGCM[+16]G",
+            "GCM[+16]GCM[+16]G",
+        ];
+        assert_eq!(peptides, expected);
+    }
+
+    #[test]
+    fn test_per_mod_limit_zero() {
+        use ModificationSpecificity::*;
+        // Limit of 0 means this mod is entirely suppressed
+        let variable_mods = [(Residue(b'M'), 16.0f32, Some(0))];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, None)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        assert_eq!(peptides, vec!["GCMGCMG"]);
+    }
+
+    #[test]
+    fn test_mixed_limited_and_unlimited() {
+        use ModificationSpecificity::*;
+        // M oxidation limited to 1; C carbamidomethylation unlimited
+        // GCMGCMG has 2 M and 2 C
+        let variable_mods = [
+            (Residue(b'M'), 16.0f32, Some(1)),
+            (Residue(b'C'), 57.0f32, None),
+        ];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, None)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        // Should include all combos with ≤1 oxidized M,
+        // but never both M residues oxidized simultaneously
+        for p in &peptides {
+            let oxid_count = p.matches("[+16]").count();
+            assert!(oxid_count <= 1, "too many oxidations in: {}", p);
+        }
+        // Both C residues carbamidomethylated simultaneously should be present
+        assert!(
+            peptides.contains(&"GC[+57]MGC[+57]MG".to_string()),
+            "expected double-C mod"
+        );
+        // Double oxidation should be absent
+        assert!(
+            !peptides.contains(&"GCM[+16]GCM[+16]G".to_string()),
+            "double oxidation should be suppressed"
+        );
+    }
+
+    #[test]
+    fn test_max_combinations_only_unmodified() {
+        use ModificationSpecificity::*;
+        // cap of 1 means only the unmodified peptide is returned
+        let variable_mods = [(Residue(b'M'), 16.0f32, None)];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, Some(1))
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        assert_eq!(peptides, vec!["GCMGCMG"]);
+    }
+
+    #[test]
+    fn test_max_combinations_prefers_fewer_ptms() {
+        use ModificationSpecificity::*;
+        // GCMGCMG with oxidation (2 sites) — normally 3 variants (unmod + 2 single + 1 double)
+        // cap at 3 means we get unmod + both singles but not the double
+        let variable_mods = [(Residue(b'M'), 16.0f32, None)];
+        let peptide = Peptide::try_from(Digest {
+            sequence: "GCMGCMG".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let static_mods = HashMap::default();
+        let peptides: Vec<String> = peptide
+            .clone()
+            .apply(&variable_mods, &static_mods, 2, Some(3))
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        assert_eq!(
+            peptides,
+            vec!["GCMGCMG", "GCM[+16]GCMG", "GCMGCM[+16]G"]
+        );
+        // Double-mod must not appear — it would require cap > 3
+        assert!(!peptides.contains(&"GCM[+16]GCM[+16]G".to_string()));
     }
 }
