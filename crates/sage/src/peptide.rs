@@ -878,16 +878,33 @@ mod test {
 
         let result = peptide
             .clone()
-            .apply(&[], &positional, &static_mods, 2, None, usize::MAX)
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>();
+            .apply(&[], &positional, &static_mods, 2, None, usize::MAX);
+
+        // Inspect modification masses directly rather than the rendered string,
+        // which depends on the process-global Unimod label registry (another
+        // test may register a name for 79.96633 / 57.02146).
+        let has = |sites: &[(usize, f32)]| {
+            result.iter().any(|p| {
+                p.modifications.iter().enumerate().all(|(i, &m)| {
+                    let expected = sites
+                        .iter()
+                        .find(|(j, _)| *j == i)
+                        .map(|(_, mass)| *mass)
+                        .unwrap_or(0.0);
+                    (m - expected).abs() < 1e-3
+                })
+            })
+        };
 
         // Expected: unmodified, +57 on C, +80 on D, +57+80 (combination of both)
         assert_eq!(result.len(), 4, "{:?}", result);
-        assert!(result.iter().any(|s| s == "ACDEK"));
-        assert!(result.iter().any(|s| s.contains("AC[+57.02146]DEK")));
-        assert!(result.iter().any(|s| s.contains("ACD[+79.96633]EK")));
+        assert!(has(&[]), "missing unmodified form");
+        assert!(has(&[(1, 57.021_46)]), "missing +57 on C");
+        assert!(has(&[(2, 79.966_33)]), "missing +80 on D");
+        assert!(
+            has(&[(1, 57.021_46), (2, 79.966_33)]),
+            "missing +57/+80 combination"
+        );
     }
 
     #[test]
@@ -991,27 +1008,27 @@ mod test {
         // 1 global mod allowed, 2 positional mods allowed -> up to 3 total.
         let result = peptide
             .clone()
-            .apply(&variable, &positional, &static_mods, 1, Some(2), usize::MAX)
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>();
+            .apply(&variable, &positional, &static_mods, 1, Some(2), usize::MAX);
 
-        let count_mass = |s: &str, m: f32| s.matches(&format!("[{:+}]", m)).count();
+        // Count modification masses directly (registry-independent; the rendered
+        // string would show [Oxidation] if another test registered the label).
+        let count_mass =
+            |p: &Peptide, m: f32| p.modifications.iter().filter(|&&x| (x - m).abs() < 1e-3).count();
 
         // A variant with exactly 1 Oxidation + 2 Carbamidomethyl (3 mods) exists.
         assert!(
             result
                 .iter()
-                .any(|s| count_mass(s, oxidation) == 1 && count_mass(s, carbamido) == 2),
+                .any(|p| count_mass(p, oxidation) == 1 && count_mass(p, carbamido) == 2),
             "expected a 1-global + 2-positional variant, got {:?}",
-            result
+            result.iter().map(|p| p.to_string()).collect::<Vec<_>>()
         );
         // The global budget of 1 is respected: no variant carries 2 Oxidations,
         // even though three methionines are available.
         assert!(
-            result.iter().all(|s| count_mass(s, oxidation) <= 1),
+            result.iter().all(|p| count_mass(p, oxidation) <= 1),
             "global cap of 1 violated: {:?}",
-            result
+            result.iter().map(|p| p.to_string()).collect::<Vec<_>>()
         );
     }
 }
