@@ -14,7 +14,7 @@ pub enum ScoreType {
 }
 
 /// Structure to hold temporary scores
-#[derive(Copy, Clone, Default, Debug, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Default, Debug, PartialEq)]
 struct Score {
     peptide: PeptideIx,
     matched_b: u16,
@@ -36,6 +36,18 @@ impl Ord for Score {
         self.hyperscore
             .partial_cmp(&other.hyperscore)
             .unwrap_or(std::cmp::Ordering::Less)
+    }
+}
+
+// `PartialOrd` MUST agree with the manual `Ord` above. Deriving it instead would
+// compare fields in declaration order (`peptide` first), which disagrees with
+// `Ord` (hyperscore only). `bounded_min_heapify` selects via the `<`/`>`
+// operators (i.e. `PartialOrd`), so a derived impl silently made the low-memory
+// prefilter keep the highest-`PeptideIx` candidates rather than the
+// highest-hyperscore ones, pruning the true best PSM.
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
